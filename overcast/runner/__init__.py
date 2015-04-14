@@ -130,6 +130,99 @@ def get_creds_from_env():
 #    d['cacert'] = os.environ.get('OS_CACERT', None)
     return d
 
+
+class Node(object):
+
+    def __init__(self, name, info, keypair, userdata, runner, record_resource=None):
+        self.record_resource = lambda *args, **kwargs: None
+        self.name      = name
+        self.info      = info
+        self.runner    = runner
+        self.keypair   = keypair
+        self.userdata  = userdata
+        self.server_id = None
+        self.fip_ids   = set()
+        self.port_ids  = set()
+        self.fip_address = None
+        self.server_status = None
+        self.nc = self.runner.get_nova_client()
+        if self.info['image'] in self.runner.mappings.get('images', {}):
+            self.info['image'] = self.runner.mappings['images'][self.info['image']]
+
+        if self.info['flavor'] in self.runner.mappings.get('flavors', {}):
+            self.info['flavor'] = self.runner.mappings['flavors'][self.info['flavor']]
+        self.image = self.nc.images.get(self.info['image'])
+        self.flavor = self.nc.flavors.get(self.info['flavor'])
+
+    ##
+    # This one poll the server and return server status.
+    ##
+    def poll(self, desired_status = 'ACTIVE'):
+        if self.server_status != desired_status:
+            self.server_status = self.nc.servers.get(self.server_id).status
+        return self.server_status
+
+    ##
+    # Cleaner: This method remove server, fip, port etc.
+    #
+    # We could keep fip and may be ports (ports are getting deleted with current
+    # neutron client), but that is going to be bit more complex to make sure
+    # right port is assigned to right fip etc, so atm, just removing them.
+    ##
+    def clean(self):
+        for fip_id in self.fip_ids:
+            delete_floating_ip(fip_id)
+            self.fip_ids.discard(fip_id)
+
+        for port_id in self.port_ids:
+            delete_port(port_id)
+            self.port_ids.discard(port_id)
+
+        server = self.nc.servers.get(self.server_id)
+        server.delete()
+
+    def build(self):
+
+        def _map_network(network):
+            if network in self.runner.mappings.get('networks', {}):
+                netid = self.runner.mappings['networks'][network]
+            elif network in self.runner.networks:
+                netid = self.runner.networks[network]
+            else:
+                netid = network
+
+            return netid
+
+        nics = []
+        for eth_idx, network in enumerate(self.info['networks']):
+           port_name = '%s_eth%d' % (self.name, eth_idx)
+           port_id = self.runner.create_port(port_name, _map_network(network['network']),
+                                      [self.runner.secgroups[secgroup] for secgroup in network.get('secgroups', [])])
+           self.record_resource('port', port_id)
+
+           if network.get('assign_floating_ip', False):
+              fip_id, self.fip_address = self.runner.create_floating_ip()
+              self.runner.associate_floating_ip(port_id, fip_id)
+              self.fip_ids.add(fip_id)
+              self.port_ids.add(port_id)
+           else:
+               self.fip_address = None
+
+           nics.append({'port-id': port_id})
+
+        bdm = [{'source_type': 'image',
+                'uuid': self.info['image'],
+                'destination_type': 'volume',
+                'volume_size': self.info['disk'],
+                'delete_on_termination': 'true',
+                'boot_index': '0'}]
+        server = self.nc.servers.create(self.name, image=None,
+                                   block_device_mapping_v2=bdm,
+                                   flavor=self.flavor, nics=nics,
+                                   key_name=self.keypair, userdata=self.userdata)
+        self.record_resource('server', server.id)
+        self.server_id = server.id
+
 class DeploymentRunner(object):
     def __init__(self, config=None, suffix=None, mappings=None, key=None,
                  record_resource=None):
@@ -307,56 +400,6 @@ class DeploymentRunner(object):
             self.record_resource('secgroup_rule', secgroup_rule['security_group_rule']['id'])
         return secgroup['security_group']['id']
 
-    def create_node(self, name, info, keypair, userdata):
-        nc = self.get_nova_client()
-
-        if info['image'] in self.mappings.get('images', {}):
-            info['image'] = self.mappings['images'][info['image']]
-
-        if info['flavor'] in self.mappings.get('flavors', {}):
-            info['flavor'] = self.mappings['flavors'][info['flavor']]
-
-        image = nc.images.get(info['image'])
-        flavor = nc.flavors.get(info['flavor'])
-
-        def _map_network(network):
-            if network in self.mappings.get('networks', {}):
-                netid = self.mappings['networks'][network]
-            elif network in self.networks:
-                netid = self.networks[network]
-            else:
-                netid = network
-
-            return netid
-
-        nics = []
-        for eth_idx, network in enumerate(info['networks']):
-           port_name = '%s_eth%d' % (name, eth_idx)
-           port_id = self.create_port(port_name, _map_network(network['network']),
-                                      [self.secgroups[secgroup] for secgroup in network.get('secgroups', [])])
-           self.record_resource('port', port_id)
-
-           if network.get('assign_floating_ip', False):
-               fip_id, fip_address = self.create_floating_ip()
-               self.associate_floating_ip(port_id, fip_id)
-           else:
-               fip_address = None
-
-           nics.append({'port-id': port_id})
-
-        bdm = [{'source_type': 'image',
-                'uuid': info['image'],
-                'destination_type': 'volume',
-                'volume_size': info['disk'],
-                'delete_on_termination': 'true',
-                'boot_index': '0'}]
-        server = nc.servers.create(name, image=None,
-                                   block_device_mapping_v2=bdm,
-                                   flavor=flavor, nics=nics,
-                                   key_name=keypair, userdata=userdata)
-        self.record_resource('server', server.id)
-        return server.id, fip_address
-
     def shell_step(self, details, environment=None):
         env_prefix = 'ALL_NODES=%s' % pipes.quote(' '.join([self.add_suffix(s) for s in self.nodes.keys()]))
 
@@ -413,7 +456,7 @@ class DeploymentRunner(object):
 
     def shell_step_cmd(self, details, env_prefix=''):
         if details.get('type', None) == 'remote':
-             node = self.nodes[details['node']][1]
+             node = self.nodes[details['node']].fip_address
              return 'ssh -o StrictHostKeyChecking=no ubuntu@%s "%s bash"' % (node, env_prefix)
         else:
              return '%s bash' % (env_prefix,)
@@ -440,6 +483,24 @@ class DeploymentRunner(object):
         else:
             userdata = None
 
+        pending_nodes = set()
+        done          = set()
+
+        if details.get('retry-delay', False):
+            retry_delay = utils.parse_time(details['retry-delay'])
+        else:
+            retry_delay = 5
+
+        if details.get('timeout', False):
+            provision_timeout = utils.parse_time(details['timeout'])
+            deadline =  time.time() + provision_timeout
+        else:
+            provision_timeout = None
+            deadline = None
+
+        def wait():
+            time.sleep(retry_delay)
+
         for base_network_name, network_info in stack['networks'].items():
             if base_network_name in self.networks:
                 continue
@@ -459,16 +520,36 @@ class DeploymentRunner(object):
                 continue
             def _create_node(base_name):
                 node_name = self.add_suffix(base_name)
-                self.nodes[base_name] = self.create_node(node_name, node_info,
-                                                         keypair=keypair_name,
-                                                         userdata=userdata)
+                self.nodes[base_name] = Node(node_name, node_info,
+                                                        keypair=keypair_name,
+                                                        userdata=userdata,
+                                                        runner=self)
+                self.nodes[base_name].build()
 
             if 'number' in node_info:
                 count = node_info.pop('number')
                 for idx in range(1, count+1):
-                    _create_node('%s%d' % (base_node_name, idx))
+                    node_name = '%s%d' % (base_node_name, idx)
+                    _create_node(node_name)
+                    pending_nodes.add(node_name)
             else:
                 _create_node(base_node_name)
+                pending_nodes.add(base_node_name)
+
+        while pending_nodes:
+            time.sleep(5)
+            for name in pending_nodes:
+                if self.nodes[name].poll() == 'ACTIVE':
+                    done.add(name)
+                if self.nodes[name].poll() == 'ERROR':
+                    if details.get('retry-if-fails', False):
+                        wait()
+                        if deadline and time.time() > deadline:
+                            raise exceptions.ProvisionTimedOutException(stdin)
+                        self.nodes[name].clean()
+                        self.nodes[name].build()
+                    raise exceptions.ProvisionFailedException(stdin)
+            pending_nodes = pending_nodes.difference(done)
 
     def deploy(self, name):
         for step in self.cfg[name]:

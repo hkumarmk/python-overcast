@@ -27,3 +27,9 @@ class CommandFailedException(OvercastException):
 
 class DuplicateResourceException(OvercastException):
     pass
+
+class ProvisionFailedException(OvercastException):
+    pass
+
+class ProvisionTimedOutException(OvercastException):
+    pass

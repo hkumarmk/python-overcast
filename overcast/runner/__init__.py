@@ -133,17 +133,17 @@ def get_creds_from_env():
 
 class Node(object):
 
-    def __init__(self, name, info, keypair, userdata, runner, record_resource=None):
+    def __init__(self, name, info, keypair, userdata, runner):
         self.record_resource = lambda *args, **kwargs: None
-        self.name      = name
-        self.info      = info
-        self.runner    = runner
-        self.keypair   = keypair
-        self.userdata  = userdata
+        self.name = name
+        self.info = info
+        self.runner = runner
+        self.keypair = keypair
+        self.userdata = userdata
         self.server_id = None
-        self.fip_ids   = set()
-        self.port_ids  = set()
-        self.fip_address = None
+        self.fip_ids = set()
+        self.port_ids = set()
+        self.fip_addresses = set()
         self.server_status = None
         self.nc = self.runner.get_nova_client()
         if self.info['image'] in self.runner.mappings.get('images', {}):
@@ -154,32 +154,32 @@ class Node(object):
         self.image = self.nc.images.get(self.info['image'])
         self.flavor = self.nc.flavors.get(self.info['flavor'])
 
-    ##
-    # This one poll the server and return server status.
-    ##
     def poll(self, desired_status = 'ACTIVE'):
+        """
+        This one poll nova and return the server status
+        """
         if self.server_status != desired_status:
             self.server_status = self.nc.servers.get(self.server_id).status
         return self.server_status
 
-    ##
-    # Cleaner: This method remove server, fip, port etc.
-    #
-    # We could keep fip and may be ports (ports are getting deleted with current
-    # neutron client), but that is going to be bit more complex to make sure
-    # right port is assigned to right fip etc, so atm, just removing them.
-    ##
     def clean(self):
+        """
+        Cleaner: This method remove server, fip, port etc.
+        We could keep fip and may be ports (ports are getting deleted with current
+        neutron client), but that is going to be bit more complex to make sure
+        right port is assigned to right fip etc, so atm, just removing them.
+        """
         for fip_id in self.fip_ids:
-            delete_floating_ip(fip_id)
-            self.fip_ids.discard(fip_id)
+            self.runner.delete_floating_ip(fip_id)
+        self.fip_ids = set()
+        self.fip_addresses = set()
 
         for port_id in self.port_ids:
-            delete_port(port_id)
-            self.port_ids.discard(port_id)
+            self.runner.delete_port(port_id)
+        self.port_ids = set()
 
-        server = self.nc.servers.get(self.server_id)
-        server.delete()
+        server = self.nc.servers.delete(self.server_id)
+        self.server_id = None
 
     def build(self):
 
@@ -198,15 +198,14 @@ class Node(object):
            port_name = '%s_eth%d' % (self.name, eth_idx)
            port_id = self.runner.create_port(port_name, _map_network(network['network']),
                                       [self.runner.secgroups[secgroup] for secgroup in network.get('secgroups', [])])
-           self.record_resource('port', port_id)
+           self.runner.record_resource('port', port_id)
+           self.port_ids.add(port_id)
 
            if network.get('assign_floating_ip', False):
-              fip_id, self.fip_address = self.runner.create_floating_ip()
+              fip_id, fip_address = self.runner.create_floating_ip()
               self.runner.associate_floating_ip(port_id, fip_id)
+              self.fip_addresses.add(fip_address)
               self.fip_ids.add(fip_id)
-              self.port_ids.add(port_id)
-           else:
-               self.fip_address = None
 
            nics.append({'port-id': port_id})
 
@@ -220,7 +219,7 @@ class Node(object):
                                    block_device_mapping_v2=bdm,
                                    flavor=self.flavor, nics=nics,
                                    key_name=self.keypair, userdata=self.userdata)
-        self.record_resource('server', server.id)
+        self.runner.record_resource('server', server.id)
         self.server_id = server.id
 
 class DeploymentRunner(object):
@@ -456,7 +455,7 @@ class DeploymentRunner(object):
 
     def shell_step_cmd(self, details, env_prefix=''):
         if details.get('type', None) == 'remote':
-             node = self.nodes[details['node']].fip_address
+              node = next(iter(self.nodes[details['node']].fip_addresses))
              return 'ssh -o StrictHostKeyChecking=no ubuntu@%s "%s bash"' % (node, env_prefix)
         else:
              return '%s bash' % (env_prefix,)
@@ -484,7 +483,6 @@ class DeploymentRunner(object):
             userdata = None
 
         pending_nodes = set()
-        done          = set()
 
         if details.get('retry-delay', False):
             retry_delay = utils.parse_time(details['retry-delay'])
@@ -536,8 +534,8 @@ class DeploymentRunner(object):
                 _create_node(base_node_name)
                 pending_nodes.add(base_node_name)
 
-        while pending_nodes:
-            time.sleep(5)
+        while True:
+            done = set()
             for name in pending_nodes:
                 if self.nodes[name].poll() == 'ACTIVE':
                     done.add(name)
@@ -545,11 +543,14 @@ class DeploymentRunner(object):
                     if details.get('retry-if-fails', False):
                         wait()
                         if deadline and time.time() > deadline:
-                            raise exceptions.ProvisionTimedOutException(stdin)
+                            raise exceptions.ProvisionTimedOutException()
                         self.nodes[name].clean()
                         self.nodes[name].build()
-                    raise exceptions.ProvisionFailedException(stdin)
+                    raise exceptions.ProvisionFailedException()
             pending_nodes = pending_nodes.difference(done)
+            if not pending_nodes:
+                break
+            time.sleep(5)
 
     def deploy(self, name):
         for step in self.cfg[name]:

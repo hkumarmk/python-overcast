@@ -455,8 +455,10 @@ class DeploymentRunner(object):
 
     def shell_step_cmd(self, details, env_prefix=''):
         if details.get('type', None) == 'remote':
-              node = next(iter(self.nodes[details['node']].fip_addresses))
-             return 'ssh -o StrictHostKeyChecking=no ubuntu@%s "%s bash"' % (node, env_prefix)
+            for fip_addr in self.nodes[details['node']].fip_addresses:
+                node = fip_addr
+                break
+            return 'ssh -o StrictHostKeyChecking=no ubuntu@%s "%s bash"' % (node, env_prefix)
         else:
              return '%s bash' % (env_prefix,)
 

@@ -3,7 +3,7 @@ nodes:
     number: 2
     flavor: bootstrap
     image: trusty
-    nics:
+    networks:
     - network: default
       securitygroups:
       - jumphost
@@ -11,7 +11,7 @@ nodes:
   other:
     flavor: bootstrap
     image: trusty
-    nics:
+    networks:
     - network: default
       securitygroups:
       - jumphost

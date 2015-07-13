@@ -16,6 +16,9 @@
 #
 from setuptools import setup, find_packages
 
+with open('requirements.txt', 'r') as fp:
+    requirements = [x.strip() for x in fp]
+
 setup(
     name='overcast',
     version='0.1a',
@@ -23,7 +26,7 @@ setup(
     packages=find_packages(),
     include_package_data=True,
     zip_safe=False,
-    install_requires=['pyYAML'],
+    install_requires=requirements,
     tests_require=['mock', 'nose'],
     test_suite='nose.collector',
     entry_points={'console_scripts': ['overcast=overcast.runner:main']}

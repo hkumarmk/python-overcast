@@ -1,5 +1,6 @@
 python-novaclient
-python-keystoneclient
+python-keystoneclient>=1.6.0
 python-neutronclient
+python-cinderclient
 pyYAML
 mock

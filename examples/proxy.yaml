@@ -1,29 +1,25 @@
 nodes:
-  bootstrap:
-    flavor: bootstrap
+  proxy:
+    flavor: proxy
     image: trusty
     disk: 10
+    export: true
     networks:
     - network: undercloud
       securitygroups:
-      - jumphost
-      - undercloud
+      - proxy
       assign_floating_ip: true
-  hidden:
-    flavor: bootstrap
-    image: trusty
-    disk: 10
-    networks:
-    - network: undercloud
-      securitygroups:
-      - undercloud
 networks:
   undercloud:
     cidr: 10.130.182.0/24
 securitygroups:
-  jumphost:
+  proxy:
   - cidr: 0.0.0.0/0
     from_port: 22
     to_port: 22
+    protocol: tcp
+  - source_group: undercloud
+    from_port: 3128
+    to_port: 3128
     protocol: tcp
   undercloud:

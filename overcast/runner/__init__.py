@@ -25,6 +25,9 @@ import sys
 import time
 import yaml
 
+from neutronclient.common.exceptions import Conflict as NeutronConflict
+from novaclient.exceptions import Conflict as NovaConflict
+
 from overcast import utils
 from overcast import exceptions
 
@@ -37,7 +40,7 @@ def load_mappings(f='.overcast.mappings.ini'):
         parser = ConfigParser.SafeConfigParser()
         parser.readfp(fp)
         mappings = {}
-        for t in ('flavors', 'networks', 'images'):
+        for t in ('flavors', 'networks', 'images', 'routers'):
             mappings[t] = {}
             if parser.has_section(t):
                 mappings[t].update(parser.items(t))
@@ -51,7 +54,7 @@ def find_weak_refs(stack):
     for node_name, node in stack['nodes'].items():
         images.add(node['image'])
         flavors.add(node['flavor'])
-        networks.update([n['network'] for n in node['nics']])
+        networks.update([n['network'] for n in node['networks']])
 
     dynamic_networks = set()
     for network_name, network in stack.get('networks', {}).items():
@@ -124,17 +127,119 @@ def get_creds_from_env():
     d['password'] = os.environ['OS_PASSWORD']
     d['auth_url'] = os.environ['OS_AUTH_URL']
     d['tenant_name'] = os.environ['OS_TENANT_NAME']
-#    d['region_name'] = os.environ.get('OS_REGION_NAME')
-#    d['cacert'] = os.environ.get('OS_CACERT', None)
     return d
 
+
+class Node(object):
+    def __init__(self, name, info, runner, keypair=None, userdata=None):
+        self.record_resource = lambda *args, **kwargs: None
+        self.name = name
+        self.info = info
+        self.runner = runner
+        self.keypair = keypair
+        self.userdata = userdata
+        self.server_id = None
+        self.fip_ids = set()
+        self.ports = []
+        self.server_status = None
+        self.image = None
+        self.flavor = None
+        self.attempts_left = runner.retry_count + 1
+
+        if self.info.get('image') in self.runner.mappings.get('images', {}):
+            self.info['image'] = self.runner.mappings['images'][self.info['image']]
+
+        if self.info.get('flavor') in self.runner.mappings.get('flavors', {}):
+            self.info['flavor'] = self.runner.mappings['flavors'][self.info['flavor']]
+
+    def poll(self, desired_status = 'ACTIVE'):
+        """
+        This one poll nova and return the server status
+        """
+        if self.server_status != desired_status:
+            self.server_status = self.runner.get_nova_client().servers.get(self.server_id).status
+        return self.server_status
+
+    def clean(self):
+        """
+        Cleaner: This method remove server, fip, port etc.
+        We could keep fip and may be ports (ports are getting deleted with current
+        neutron client), but that is going to be bit more complex to make sure
+        right port is assigned to right fip etc, so atm, just removing them.
+        """
+        for fip_id in self.fip_ids:
+            self.runner.delete_floatingip(fip_id)
+        self.fip_ids = set()
+
+        for port in self.ports:
+            self.runner.delete_port(port['id'])
+        self.ports = []
+
+        server = self.runner.delete_server(self.server_id)
+        self.server_id = None
+
+    def create_nics(self, networks):
+        nics = []
+        for eth_idx, network in enumerate(networks):
+           port_name = '%s_eth%d' % (self.name, eth_idx)
+           port_info = self.runner.create_port(port_name, network['network'],
+                                               [self.runner.secgroups[secgroup] for secgroup in network.get('securitygroups', [])])
+           self.runner.record_resource('port', port_info['id'])
+           self.ports.append(port_info)
+
+           if network.get('assign_floating_ip', False):
+              fip_id, fip_address = self.runner.create_floating_ip()
+              self.runner.associate_floating_ip(port_info['id'], fip_id)
+              port_info['floating_ip'] = fip_address
+              self.fip_ids.add(fip_id)
+
+           nics.append(port_info['id'])
+        return nics
+
+    def build(self):
+        if self.flavor is None:
+            self.flavor = self.runner.get_nova_client().flavors.get(self.info['flavor'])
+
+        nics = [{'port-id': port_id} for port_id in self.create_nics(self.info['networks'])]
+
+        volume = self.runner.get_cinder_client().volumes.create(size=self.info['disk'],
+                                                                imageRef=self.info['image'])
+        self.record_resource('volume', volume.id)
+
+        while volume.status != 'available':
+            time.sleep(3)
+            volume = self.runner.get_cinder_client().volumes.get(volume.id)
+
+        bdm = {'vda': '%s:::1' % (volume.id,)}
+
+        server = self.runner.get_nova_client().servers.create(self.name, image=None,
+                                                              block_device_mapping=bdm,
+                                                              flavor=self.flavor, nics=nics,
+                                                              key_name=self.keypair, userdata=self.userdata)
+        self.runner.record_resource('server', server.id)
+        self.server_id = server.id
+        self.attempts_left -= 1
+
+    @property
+    def floating_ip(self):
+        for port in self.ports:
+            if 'floating_ip' in port:
+                return port['floating_ip']
+
 class DeploymentRunner(object):
-    def __init__(self):
+    def __init__(self, config=None, suffix=None, mappings=None, key=None,
+                 record_resource=None, retry_count=0):
+        self.cfg = config
+        self.suffix = suffix
+        self.mappings = mappings or {}
+        self.key = key
+        self.retry_count = retry_count
+        self.record_resource = lambda *args, **kwargs: None
+
         self.conncache = {}
         self.networks = {}
         self.secgroups = {}
         self.nodes = {}
-        self.prefix = None
 
     def get_keystone_session(self):
         from keystoneclient import session as keystone_session
@@ -154,16 +259,96 @@ class DeploymentRunner(object):
     def get_nova_client(self):
         import novaclient.client as novaclient
         if 'nova' not in self.conncache:
-            ks = self.get_keystone_session()
-            self.conncache['nova'] = novaclient.Client("1.1", session=ks)
+            kwargs = {'session': self.get_keystone_session()}
+            if 'OS_REGION_NAME' in os.environ:
+                kwargs['region_name'] = os.environ['OS_REGION_NAME']
+            self.conncache['nova'] = novaclient.Client("2", **kwargs)
         return self.conncache['nova']
+
+    def get_cinder_client(self):
+        import cinderclient.client as cinderclient
+        if 'cinder' not in self.conncache:
+            kwargs = {'session': self.get_keystone_session()}
+            if 'OS_REGION_NAME' in os.environ:
+                kwargs['region_name'] = os.environ['OS_REGION_NAME']
+            self.conncache['cinder'] = cinderclient.Client('1', **kwargs)
+        return self.conncache['cinder']
 
     def get_neutron_client(self):
         import neutronclient.neutron.client as neutronclient
         if 'neutron' not in self.conncache:
-            ks = self.get_keystone_session()
-            self.conncache['neutron'] = neutronclient.Client('2.0', session=ks)
+            kwargs = {'session': self.get_keystone_session()}
+            if 'OS_REGION_NAME' in os.environ:
+                kwargs['region_name'] = os.environ['OS_REGION_NAME']
+            self.conncache['neutron'] = neutronclient.Client('2.0', **kwargs)
         return self.conncache['neutron']
+
+    def _map_network(self, network):
+        if network in self.mappings.get('networks', {}):
+            return self.mappings['networks'][network]
+        elif network in self.networks:
+            return self.networks[network]
+        return network
+
+    def detect_existing_resources(self):
+        neutron = self.get_neutron_client()
+
+        suffix = self.add_suffix('')
+        if suffix:
+            strip_suffix = lambda s:s[:-len(suffix)]
+        else:
+            strip_suffix = lambda s:s
+
+        network_name_by_id = {}
+        for network in neutron.list_networks()['networks']:
+            if network['name'].endswith(suffix):
+                base_name = strip_suffix(network['name'])
+                if base_name in self.networks:
+                    raise exceptions.DuplicateResourceException('Network', network['name'])
+
+                self.networks[base_name] = network['id']
+                network_name_by_id[network['id']] = base_name
+
+        raw_ports = [{'id': port['id'],
+                      'fixed_ip': port['fixed_ips'][0]['ip_address'],
+                      'mac': port['mac_address'],
+                      'network_name': network_name_by_id.get(port['network_id'], port['network_id'])}
+                     for port in neutron.list_ports()['ports']]
+        ports_by_id = {port['id']: port for port in raw_ports}
+        ports_by_mac = {port['mac']: port for port in raw_ports}
+
+        for fip in neutron.list_floatingips()['floatingips']:
+            port_id = fip['port_id']
+            if not port_id:
+                continue
+            port = ports_by_id[port_id]
+            port['floating_ip'] = fip['floating_ip_address']
+
+        for secgroup in neutron.list_security_groups()['security_groups']:
+            if secgroup['name'].endswith(suffix):
+                base_name = strip_suffix(secgroup['name'])
+                if base_name in self.secgroups:
+                    raise exceptions.DuplicateResourceException('Security Group', secgroup['name'])
+
+                self.secgroups[base_name] = secgroup['id']
+
+        nova = self.get_nova_client()
+
+        for node in nova.servers.list():
+            if node.name.endswith(suffix):
+                base_name = strip_suffix(node.name)
+                if base_name in self.nodes:
+                    raise exceptions.DuplicateResourceException('Node', node.name)
+
+                self.nodes[base_name] = Node(node.name, {}, self)
+                for address in node.addresses.values():
+                    mac = address[0]['OS-EXT-IPS-MAC:mac_addr']
+                    port = ports_by_mac[mac]
+                    self.nodes[base_name].ports.append(port)
+
+    def delete_volume(self, uuid):
+        cc = self.get_cinder_client()
+        cc.volumes.delete(uuid)
 
     def delete_port(self, uuid):
         nc = self.get_neutron_client()
@@ -173,9 +358,31 @@ class DeploymentRunner(object):
         nc = self.get_neutron_client()
         nc.delete_network(uuid)
 
+    def delete_router(self, uuid):
+        nc = self.get_neutron_client()
+        nc.delete_router(uuid)
+
     def delete_subnet(self, uuid):
         nc = self.get_neutron_client()
-        nc.delete_subnet(uuid)
+        try:
+            nc.delete_subnet(uuid)
+        except NeutronConflict, e:
+            # This is probably due to the router port. Let's find it.
+            router_found = False
+            for port in nc.list_ports(device_owner='network:router_interface')['ports']:
+                for fixed_ip in port['fixed_ips']:
+                    if fixed_ip['subnet_id'] == uuid:
+                        router_found = True
+                        nc.remove_interface_router(port['device_id'],
+                                                   {'subnet_id': uuid})
+                        break
+            if router_found:
+                # Let's try again
+                nc.delete_subnet(uuid)
+            else:
+                # Ok, we didn't find a router, so clearly this is a different
+                # problem. Just re-raise the original exception.
+                raise
 
     def delete_secgroup(self, uuid):
         nc = self.get_neutron_client()
@@ -199,30 +406,36 @@ class DeploymentRunner(object):
 
     def create_port(self, name, network, secgroups):
         nc = self.get_neutron_client()
+        network_id = self._map_network(network)
         port = {'name': name,
                 'admin_state_up': True,
-                'network_id': network,
+                'network_id': network_id,
                 'security_groups': secgroups}
-        port = nc.create_port({'port': port})
-        return port['port']['id']
+        port = nc.create_port({'port': port})['port']
 
-    def create_keypair(self, name, path):
+        return {'id': port['id'],
+                'fixed_ip': port['fixed_ips'][0]['ip_address'],
+                'mac': port['mac_address'],
+                'network_name': network}
+
+    def create_keypair(self, name, keydata):
         nc = self.get_nova_client()
-        with open(path, 'r') as fp:
-            key = fp.read()
-        nc.keypairs.create(name, key)
+        try:
+            nc.keypairs.create(name, keydata)
+        except NovaConflict:
+            pass
 
     def find_floating_network(self, ):
         nc = self.get_neutron_client()
         networks = nc.list_networks(**{'router:external': True})
         return networks['networks'][0]['id']
 
-    def create_floating_ip(self, record_resource):
+    def create_floating_ip(self):
         nc = self.get_neutron_client()
         floating_network = self.find_floating_network()
         floatingip = {'floating_network_id': floating_network}
         floatingip = nc.create_floatingip({'floatingip': floatingip})
-        record_resource('floatingip', floatingip['floatingip']['id'])
+        self.record_resource('floatingip', floatingip['floatingip']['id'])
         return (floatingip['floatingip']['id'],
                 floatingip['floatingip']['floating_ip_address'])
 
@@ -230,92 +443,75 @@ class DeploymentRunner(object):
         nc = self.get_neutron_client()
         nc.update_floatingip(fip_id, {'floatingip': {'port_id': port_id}})
 
-    def create_network(self, name, info, record_resource):
+    def create_network(self, name, info):
         nc = self.get_neutron_client()
         network = {'name': name, 'admin_state_up': True}
         network = nc.create_network({'network': network})
-        record_resource('network', network['network']['id'])
+        self.record_resource('network', network['network']['id'])
 
         subnet = {"network_id": network['network']['id'],
                   "ip_version": 4,
                   "cidr": info['cidr'],
                   "name": name}
-        subnet = nc.create_subnet({'subnet': subnet})
-        record_resource('subnet', subnet['subnet']['id'])
+        subnet = nc.create_subnet({'subnet': subnet})['subnet']
+        self.record_resource('subnet', subnet['id'])
+
+        if '*' in self.mappings.get('routers', {}):
+            nc.add_interface_router(self.mappings['routers']['*'], {'subnet_id': subnet['id']})
 
         return network['network']['id']
 
-    def create_security_group(self, name, info, record_resource):
+    def create_security_group(self, base_name, info):
         nc = self.get_neutron_client()
+        name = self.add_suffix(base_name)
+
         secgroup = {'name': name}
-        secgroup = nc.create_security_group({'security_group': secgroup})
-        record_resource('secgroup', secgroup['security_group']['id'])
+        secgroup = nc.create_security_group({'security_group': secgroup})['security_group']
+
+        self.record_resource('secgroup', secgroup['id'])
+        self.secgroups[base_name] = secgroup['id']
 
         for rule in (info or []):
             secgroup_rule = {"direction": "ingress",
-                             "remote_ip_prefix": rule['cidr'],
                              "ethertype": "IPv4",
                              "port_range_min": rule['from_port'],
                              "port_range_max": rule['to_port'],
                              "protocol": rule['protocol'],
-                             "security_group_id": secgroup['security_group']['id']}
-            secgroup_rule = nc.create_security_group_rule({'security_group_rule': secgroup_rule})
-            record_resource('secgroup_rule', secgroup_rule['security_group_rule']['id'])
-        return secgroup['security_group']['id']
+                             "security_group_id": secgroup['id']}
 
-    def create_node(self, name, info, mappings, keypair,
-                    userdata, record_resource):
-        nc = self.get_nova_client()
-
-        if info['image'] in mappings.get('images', {}):
-            info['image'] = mappings['images'][info['image']]
-
-        if info['flavor'] in mappings.get('flavors', {}):
-            info['flavor'] = mappings['flavors'][info['flavor']]
-
-        image = nc.images.get(info['image'])
-        flavor = nc.flavors.get(info['flavor'])
-
-        def _map_network(network):
-            if network in mappings.get('networks', {}):
-                netid = mappings['networks'][network]
-            elif network in self.networks:
-                netid = self.networks[network]
+            if 'source_group' in rule:
+                secgroup_rule['remote_group_id'] = self.secgroups.get(rule['source_group'], rule['source_group'])
             else:
-                netid = network
+                secgroup_rule['remote_ip_prefix'] = rule['cidr']
 
-            return netid
+            secgroup_rule = nc.create_security_group_rule({'security_group_rule': secgroup_rule})
+            self.record_resource('secgroup_rule', secgroup_rule['security_group_rule']['id'])
 
-        nics = []
-        for eth_idx, network in enumerate(info['networks']):
-           port_name = '%s_eth%d' % (name, eth_idx)
-           port_id = self.create_port(port_name, _map_network(network['network']),
-                                      [self.secgroups[secgroup] for secgroup in network.get('secgroups', [])])
-           record_resource('port', port_id)
+    def build_env_prefix(self, details):
+        env_prefix = ''
+        def add_environment(key, value):
+            return '%s=%s ' % (pipes.quote(key), pipes.quote(value))
 
-           if network.get('assign_floating_ip', False):
-               fip_id, fip_address = self.create_floating_ip(record_resource)
-               self.associate_floating_ip(port_id, fip_id)
-           else:
-               fip_address = None
+        env_prefix += add_environment('ALL_NODES',
+                                      ' '.join([self.add_suffix(s) for s in self.nodes.keys()]))
 
-           nics.append({'port-id': port_id})
+        for node_name, node in self.nodes.iteritems():
+            if node.info.get('export', False):
+                for port in node.ports:
+                    key = 'OVERCAST_%s_%s_fixed' % (node_name, port['network_name'])
+                    value = port['fixed_ip']
+                    env_prefix += add_environment(key, value)
 
-        bdm = [{'source_type': 'image',
-                'uuid': info['image'],
-                'destination_type': 'volume',
-                'volume_size': info['disk'],
-                'delete_on_termination': 'true',
-                'boot_index': '0'}]
-        server = nc.servers.create(name, image=None,
-                                   block_device_mapping_v2=bdm,
-                                   flavor=flavor, nics=nics,
-                                   key_name=keypair, userdata=userdata)
-        record_resource('server', server.id)
-        return server.id, fip_address
+        if 'environment' in details:
+            for key, value in details['environment'].items():
+                if value.startswith('$'):
+                    value = os.environ.get(value[1:])
+                env_prefix += add_environment(key, value)
 
-    def shell_step(self, details, environment=None, args=None, mappings=None):
-        env_prefix = 'ALL_NODES=%s' % pipes.quote(' '.join([self.add_prefix(s) for s in self.nodes.keys()]))
+        return env_prefix
+
+    def shell_step(self, details, environment=None):
+        env_prefix = self.build_env_prefix(details)
 
         cmd = self.shell_step_cmd(details, env_prefix)
 
@@ -370,32 +566,24 @@ class DeploymentRunner(object):
 
     def shell_step_cmd(self, details, env_prefix=''):
         if details.get('type', None) == 'remote':
-             node = self.nodes[details['node']][1]
-             return 'ssh -o StrictHostKeyChecking=no ubuntu@%s "%s bash"' % (node, env_prefix)
+            fip_addr = self.nodes[details['node']].floating_ip
+            return 'ssh -o StrictHostKeyChecking=no ubuntu@%s "%s bash"' % (fip_addr, env_prefix)
         else:
              return '%s bash' % (env_prefix,)
 
-    def add_prefix(self, s):
-        if self.prefix:
-            return '%s_%s' % (self.prefix, s)
+    def add_suffix(self, s):
+        if self.suffix:
+            return '%s_%s' % (s, self.suffix)
         else:
             return s
 
-    def provision_step(self, details, args, mappings):
+    def provision_step(self, details):
         stack = load_yaml(details['stack'])
 
-        if args.cleanup:
-            cleanup = open(args.cleanup, 'a+')
-            def record_resource(type_, id):
-                cleanup.write('%s: %s\n' % (type_, id))
-        else:
-            def record_resource(type_, id):
-                pass
-
-        if args.key:
-            keypair_name = self.add_prefix('pubkey')
-            self.create_keypair(keypair_name, args.key)
-            record_resource('keypair', keypair_name)
+        if self.key:
+            keypair_name = self.add_suffix('pubkey')
+            self.create_keypair(keypair_name, self.key)
+            self.record_resource('keypair', keypair_name)
         else:
             keypair_name = None
 
@@ -405,67 +593,122 @@ class DeploymentRunner(object):
         else:
             userdata = None
 
+        pending_nodes = set()
+
+        def wait():
+            time.sleep(5)
+
         for base_network_name, network_info in stack['networks'].items():
-            network_name = self.add_prefix(base_network_name)
+            if base_network_name in self.networks:
+                continue
+            network_name = self.add_suffix(base_network_name)
             self.networks[base_network_name] = self.create_network(network_name,
-                                                                   network_info,
-                                                                   record_resource)
+                                                                   network_info)
 
         for base_secgroup_name, secgroup_info in stack['securitygroups'].items():
-            secgroup_name = self.add_prefix(base_secgroup_name)
-            self.secgroups[base_secgroup_name] = self.create_security_group(secgroup_name,
-                                                                            secgroup_info,
-                                                                            record_resource)
+            if base_secgroup_name in self.secgroups:
+                continue
+            self.create_security_group(base_secgroup_name, secgroup_info)
 
         for base_node_name, node_info in stack['nodes'].items():
-            def _create_node(base_name):
-                node_name = self.add_prefix(base_name)
-                self.nodes[base_name] = self.create_node(node_name, node_info,
-                                                         mappings=mappings,
-                                                         keypair=keypair_name,
-                                                         userdata=userdata,
-                                                         record_resource=record_resource)
-
             if 'number' in node_info:
                 count = node_info.pop('number')
                 for idx in range(1, count+1):
-                    _create_node('%s%d' % (base_node_name, idx))
+                    node_name = '%s%d' % (base_node_name, idx)
+                    name = self._create_node(node_name, node_info,
+                                             keypair_name=keypair_name, userdata=userdata)
+                    if name:
+                        pending_nodes.add(name)
             else:
-                _create_node(base_node_name)
+                name = self._create_node(base_node_name, node_info,
+                                         keypair_name=keypair_name, userdata=userdata)
+                if name:
+                    pending_nodes.add(name)
+
+        while True:
+            pending_nodes = self._poll_pending_nodes(pending_nodes)
+            if not pending_nodes:
+                break
+            wait()
+
+    def _create_node(self, base_name, node_info, keypair_name, userdata):
+        if base_name in self.nodes:
+            return
+        node_name = self.add_suffix(base_name)
+        self.nodes[base_name] = Node(node_name, node_info,
+                                     runner=self,
+                                     keypair=keypair_name,
+                                     userdata=userdata)
+        self.nodes[base_name].build()
+        return base_name
 
 
-    def deploy(self, args, stdout=sys.stdout):
-        self.prefix = args.prefix
-        cfg = load_yaml(args.cfg)
-        if args.mappings:
-            mappings = load_mappings(args.mappings)
-        else:
-            mappings = {'images': {},
-                        'networks': {},
-                        'flavors': {}}
-        for step in cfg[args.name]:
+    def _poll_pending_nodes(self, pending_nodes):
+        done = set()
+        for name in pending_nodes:
+            state = self.nodes[name].poll()
+            if state == 'ACTIVE':
+                done.add(name)
+            elif state == 'ERROR':
+                if self.retry_count:
+                    self.nodes[name].clean()
+                    if self.nodes[name].attempts_left:
+                         self.nodes[name].build()
+                         continue
+                raise exceptions.ProvisionFailedException()
+        return pending_nodes.difference(done)
+
+
+    def deploy(self, name):
+        for step in self.cfg[name]:
             step_type = step.keys()[0]
             details = step[step_type]
             func = getattr(self, '%s_step' % step_type)
-            func(details, args=args, mappings=mappings)
+            func(details)
 
-    def cleanup(self, args, stdout=sys.stdout):
+
+def main(argv=sys.argv[1:], stdout=sys.stdout):
+    def deploy(args):
+        cfg = load_yaml(args.cfg)
+
+        if args.key:
+            with open(args.key, 'r') as fp:
+                key = fp.read()
+
+
+        dr = DeploymentRunner(config=cfg,
+                              suffix=args.suffix,
+                              mappings=load_mappings(args.mappings),
+                              key=key,
+                              retry_count=args.retry_count)
+
+        if args.cont:
+            dr.detect_existing_resources()
+
+        if args.cleanup:
+            with open(args.cleanup, 'a+') as cleanup:
+                def record_resource(type_, id):
+                    cleanup.write('%s: %s\n' % (type_, id))
+                dr.record_resource = record_resource
+
+                dr.deploy(args.name)
+        else:
+            dr.deploy(args.name)
+
+    def cleanup(args):
+        dr = DeploymentRunner()
+
         with open(args.log, 'r') as fp:
             lines = [l.strip() for l in fp]
 
         lines.reverse()
         for l in lines:
             resource_type, uuid = l.split(': ')
-            func = getattr(self, 'delete_%s' % resource_type)
+            func = getattr(dr, 'delete_%s' % resource_type)
             try:
                 func(uuid)
-            except:
-                pass
-
-
-
-def main(argv=sys.argv[1:], stdout=sys.stdout):
-    dr = DeploymentRunner()
+            except Exception, e:
+                print e
 
     parser = argparse.ArgumentParser(description='Run deployment')
 
@@ -478,17 +721,21 @@ def main(argv=sys.argv[1:], stdout=sys.stdout):
     list_refs_parser.add_argument('stack', help='YAML file describing stack')
 
     deploy_parser = subparsers.add_parser('deploy', help='Perform deployment')
-    deploy_parser.set_defaults(func=dr.deploy)
+    deploy_parser.set_defaults(func=deploy)
     deploy_parser.add_argument('--cfg', default='.overcast.yaml',
                                help='Deployment config file')
-    deploy_parser.add_argument('--prefix', help='Resource name prefix')
+    deploy_parser.add_argument('--suffix', help='Resource name suffix')
     deploy_parser.add_argument('--mappings', help='Resource map file')
     deploy_parser.add_argument('--key', help='Public key file')
     deploy_parser.add_argument('--cleanup', help='Cleanup file')
+    deploy_parser.add_argument('--retry-count', type=int, default=0,
+                               help='Retry RETRY-COUNT times before giving up provisioning a VM')
+    deploy_parser.add_argument('--incremental', dest='cont', action='store_true',
+                               help="Don't create resources if identically named ones already exist")
     deploy_parser.add_argument('name', help='Deployment to perform')
 
     cleanup_parser = subparsers.add_parser('cleanup', help='Clean up')
-    cleanup_parser.set_defaults(func=dr.cleanup)
+    cleanup_parser.set_defaults(func=cleanup)
     cleanup_parser.add_argument('log', help='Clean up log (generated by deploy)')
 
     args = parser.parse_args(argv)

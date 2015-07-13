@@ -1,0 +1,14 @@
+nodes:
+  backend:
+    flavor: proxy
+    image: trusty
+    disk: 10
+    networks:
+    - network: undercloud
+      securitygroups:
+      - undercloud
+networks:
+  undercloud:
+    cidr: 10.130.182.0/24
+securitygroups:
+  undercloud:

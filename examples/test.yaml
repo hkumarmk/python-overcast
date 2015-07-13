@@ -2,14 +2,19 @@ main:
   - shell:
       cmd: "echo Hello, world"
   - shell:
-      cmd: "echo '#!/bin/sh\necho Hello, world > /dev/console' > userdata.txt"
+      cmd: "echo '#!/bin/sh\napt-get update\napt-get install -y squid3;sed -e \"/^http_access.allow.localhost$/aacl localnet src 10.0.0.0/8\\nhttp_access allow localnet\" -i /etc/squid3/squid.conf; sudo restart squid3' > userdata.txt"
   - provision:
-      stack: teststack.yaml
+      stack: proxy.yaml
       userdata: userdata.txt
   - shell:
       cmd: 'hostname'
       type: remote
-      node: bootstrap
+      node: proxy
       retry-if-fails: true
       retry-delay: 5s
       total-timeout: 5m
+  - shell:
+      cmd: 'echo -e "#!/bin/sh\nwhile ! http_proxy=http://${OVERCAST_proxy_undercloud_fixed}:3128/ wget http://www.google.com/; do sleep 2; done" > userdata.txt'
+  - provision:
+      stack: nonproxy.yaml
+      userdata: userdata.txt

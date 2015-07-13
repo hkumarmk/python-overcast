@@ -5,7 +5,7 @@
 This is the Overcast Deployment Engine. It's a cloud centric deployment engine
 that aims to facilitate deployment for both ephemeral environments (for
 integration testing) as well for long-lived environments. Support for the
-latter is still sketchy, but it's coming soon.
+latter is still a little sketchy, but it's improving quickly.
 
 Overcast learns from a YAML file what needs to be done for your deployment.
 Here's the simplest possible example:
@@ -32,13 +32,13 @@ be executed on a remote host named web1.
 
 The shell step type has a number of attributes:
 
-- `cmd`: We've already seen this. It's the command to run. It's mandatory
+- `cmd`: We've already seen this. It's the command to run. It's mandatory.
 - `type`: Can be set to "remote" if it's to be run remotely. Optional.
-- `node`: Specifies the remote host to run on if type: remote. Optional.
+- `node`: Specifies the remote host to run on if type: remote. Mandatory if type is "remote".
 - `retry-if-fails`: A boolean specifying whether to retry if the cmd fails.
 - `retry-delay`: Time to wait between retries. An integer will be treated as seconds. You can append `s`, `m`, `h` as suffixes. They do what you think they do.
 - `timeout`: Timeout for each command run. It will be terminated if it takes longer than this and will be considered a failure.
-- `total-timeout`: A timeout for all executions of this command (useful if you `retry-if-fails`)
+- `total-timeout`: A timeout for all executions of this command (useful if you `retry-if-fails`).
 
 The other step type is "`provision`". This is where it gets interesting.
 
@@ -78,8 +78,25 @@ First all networks (and their subnets) are created. Then security groups. Then n
 
 You'll notice that `flavor` and `image` have human readable names. That's because these stack definitions should be agnostic to which cloud you're deploying to. To map these values to their correct values for a given cloud provider, a mapping file is passed in.
  
+## Invoking Overcast
+
 Let's look at how you actually use all of this.
 
-    $ cd examples; overcast deploy --cfg test.yaml --key ${HOME}/.ssh/id_rsa.pub --mappings jio.ini --prefix test1234 main 
+    $ cd examples; overcast deploy --cfg test.yaml \
+                                   --key ${HOME}/.ssh/id_rsa.pub \
+                                   --mappings mappings.ini \
+                                   --suffix test1234 \
+                                   --cleanup cleanup.log \
+                                   main
 
 `overcast` expects you to have some environment variables set to be able to authenticate. They are `OS_USERNAME`, `OS_PASSWORD`, `OS_TENANT_NAME`, `OS_AUTH_URL`. Their expected value should be fairly obvious.
+
+We're passing in a mapping file: `mappings.ini`. Here's an example that matches the example stack file above:
+
+    [flavors]
+    bootstrap = 92065143-073f-4d88-b75e-360ae5c12eac
+
+    [images]
+    trusty = e824592a-8265-4e32-98d9-8c20c3e19f7a
+
+Whenever a stack file references a flavor called "bootstrap", the mappings file provides a translation to a flavor ID specific to your target cloud. Same for images.

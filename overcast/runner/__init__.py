@@ -40,7 +40,7 @@ def load_mappings(f='.overcast.mappings.ini'):
         parser = ConfigParser.SafeConfigParser()
         parser.readfp(fp)
         mappings = {}
-        for t in ('flavors', 'networks', 'images', 'routers'):
+        for t in ('flavors', 'volumes', 'networks', 'images', 'routers'):
             mappings[t] = {}
             if parser.has_section(t):
                 mappings[t].update(parser.items(t))
@@ -152,6 +152,19 @@ class Node(object):
         if self.info.get('flavor') in self.runner.mappings.get('flavors', {}):
             self.info['flavor'] = self.runner.mappings['flavors'][self.info['flavor']]
 
+        if self.info.get('boot_volume') in self.runner.mappings.get('volumes',{}):
+            self.info['boot_volume'] = self.runner.mappings['volumes'][self.info['boot_volume']]
+
+        ##
+        # This is to allow disallowing boot_volume, in case mapfile dont have
+        # any such settings and environment file have a reference name for
+        # boot_volume
+        ##
+        try:
+            just_tmp_value=int(self.info['boot_volume'])
+        except:
+            self.info['boot_volume'] = None
+
     def poll(self, desired_status = 'ACTIVE'):
         """
         This one poll nova and return the server status
@@ -202,18 +215,17 @@ class Node(object):
 
         nics = [{'port-id': port_id} for port_id in self.create_nics(self.info['networks'])]
 
-        volume = self.runner.get_cinder_client().volumes.create(size=self.info['disk'],
-                                                                imageRef=self.info['image'])
-        self.record_resource('volume', volume.id)
+        if self.info['boot_volume']:
+            bdm_v2 = [{'source_type': 'image', 'uuid': self.info['image'],
+                        'destination_type': 'volume', 'volume_size': self.info['boot_volume'],
+                        'delete_on_termination': 'true', 'boot_index': '0'}]
+            image = None
+        else:
+            image = self.info['image']
+            bdm_v2 = None
 
-        while volume.status != 'available':
-            time.sleep(3)
-            volume = self.runner.get_cinder_client().volumes.get(volume.id)
-
-        bdm = {'vda': '%s:::1' % (volume.id,)}
-
-        server = self.runner.get_nova_client().servers.create(self.name, image=None,
-                                                              block_device_mapping=bdm,
+        server = self.runner.get_nova_client().servers.create(self.name, image=image,
+                                                              block_device_mapping_v2=bdm_v2,
                                                               flavor=self.flavor, nics=nics,
                                                               key_name=self.keypair, userdata=self.userdata)
         self.runner.record_resource('server', server.id)

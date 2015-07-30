@@ -161,8 +161,8 @@ class Node(object):
         # boot_volume
         ##
         try:
-            just_tmp_value=int(self.info['boot_volume'])
-        except:
+            int(self.info['boot_volume'])
+        except (ValueError, KeyError):
             self.info['boot_volume'] = None
 
     def poll(self, desired_status = 'ACTIVE'):
